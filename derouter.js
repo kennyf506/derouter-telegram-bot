@@ -13,14 +13,15 @@
 //   DEROUTER_ALERT_STEP= （選填）每跨過多少美元提醒一次，預設 1
 //   DEROUTER_DAILY_HOUR= （選填）每天幾點送總結（台北時間 0–23），預設 8
 //   DEROUTER_BILLING_START=（選填）第一期訂閱起始日 YYYY-MM-DD，之後每月自動換期
-//   DEROUTER_MONTHLY_COST= （選填）月成本，用於回本進度
+//   月成本依目前帳號數量與美區月繳牌價自動計算
 //   DEROUTER_DAILY_COST=   （選填）日成本，用於昨日損益
 // ==========================================
-const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const { fetchMonthlyCost, formatMonthlyCost } = require('./costs');
+const { fetchEarnings } = require('./earnings-api');
+const { fetchChainEarnings, formatChainEarnings } = require('./chain-earnings');
 
-const API_URL = 'https://api.derouter.network/api/billing/earnings';
 const STATE_FILE = path.join(__dirname, 'derouter_state.json');
 // 每日紀錄（append-only，一天一行）。平台的 allTime 會被回頭下修、不可信，
 // 所以「本期已賺」一律以這個檔為準，state 裡的數字只是它的快取鏡像。
@@ -41,7 +42,6 @@ const TZ = 'Asia/Taipei';        // 以台北時間為準
 // ---- 訂閱成本（供每日損益報告用；沒設定就只顯示收益不算損益）----
 // BILLING_START 是「第一期」的起始日，之後每月同日自動滾入新的一期，不需手動更新
 const BILLING_START = (process.env.DEROUTER_BILLING_START || '').trim(); // YYYY-MM-DD
-const MONTHLY_COST = Number(process.env.DEROUTER_MONTHLY_COST) || 0;
 const DAILY_COST = Number(process.env.DEROUTER_DAILY_COST) || 0;
 // 每日「達標」門檻（美元，可多個）。每個門檻各自記錄達標時間與平均，達標時提醒。
 // 預設＝日成本與其兩倍（例：7 → 7,14）；可用 DEROUTER_GOAL_TARGETS=7,14 覆寫。
@@ -135,20 +135,8 @@ function saveState(s) {
     }
 }
 
-// ---- 打 DeRouter API 拿收益 ----
-// 回傳：{ today, todayTasks, week, weekTasks, allTime, allTimeTasks, requestsAll }
-async function fetchEarnings() {
-    const key = process.env.DEROUTER_MGMT_KEY;
-    if (!key) throw new Error('缺少 DEROUTER_MGMT_KEY 環境變數');
-    const res = await axios.get(API_URL, {
-        headers: { Authorization: `Bearer ${key}` },
-        timeout: 15000,
-    });
-    return res.data;
-}
-
 // ---- 把收益資料排版成 Telegram 訊息 ----
-function formatEarnings(d) {
+function formatEarnings(d, projection = '') {
     const m = (n) => `$${Number(n).toFixed(4)}`;
     return (
         `💰 <b>DeRouter 收益</b>\n\n` +
@@ -156,29 +144,73 @@ function formatEarnings(d) {
         `🗓 本週 Week：<b>${m(d.week)}</b>（${d.weekTasks} tasks）\n` +
         `🏆 累計 AllTime：<b>${m(d.allTime)}</b>（${d.allTimeTasks} tasks）\n` +
         `📨 Requests Served：<b>${d.requestsAll}</b>\n\n` +
+        (projection ? `${projection}\n\n` : '') +
         `<i>※ today/week 以 UTC 日界計算（UTC 午夜＝台北早上 8 點換日）</i>`
     );
 }
 
+function formatExpectedReturn(d, cost, entries = readDailyLog(), now = new Date()) {
+    const today = now.toISOString().slice(0, 10);
+    const cutoff = new Date(now.getTime() - 7 * 86400000).toISOString().slice(0, 10);
+    const samples = new Map();
+    for (const entry of entries) {
+        if (entry.date >= cutoff && entry.date < today && (entry.days == null || entry.days === 1)
+            && entry.earned != null && entry.earned !== '' && Number.isFinite(Number(entry.earned)) && Number(entry.earned) >= 0) {
+            samples.set(entry.date, Number(entry.earned));
+        }
+    }
+    const lines = ['📈 <b>預期月收益率</b>'];
+    let dailyAverage;
+    if (samples.size) {
+        dailyAverage = [...samples.values()].reduce((sum, n) => sum + n, 0) / samples.size;
+        lines.push(`依近 7 天已記錄的 ${samples.size} 個收益日，日均 US$${dailyAverage.toFixed(2)}`);
+    } else {
+        const elapsed = now.getTime() - Date.parse(`${today}T00:00:00Z`);
+        if (elapsed < 3600000 || d.today == null || !Number.isFinite(Number(d.today)) || Number(d.today) < 0) {
+            return `${lines[0]}\n資料不足，累積完整收益日或 UTC 換日滿 1 小時後顯示`;
+        }
+        dailyAverage = Number(d.today) / (elapsed / 86400000);
+        lines.push(`尚無完整日紀錄，依今日已過 ${(elapsed / 3600000).toFixed(1)} 小時收益推估`);
+    }
+    const days = BILLING_START ? daysInPeriod(currentPeriodStart(today))
+        : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
+    const revenue = dailyAverage * days;
+    lines.push(`預期月收益：<b>US$${revenue.toFixed(2)}</b>（以 ${days} 天估算）`);
+    if (!cost || cost.unknownCount > 0) {
+        lines.push('月成本未完整取得，暫不計算淨利及收益率');
+    } else {
+        const profit = revenue - cost.total;
+        lines.push(`每月成本估算：US$${cost.total.toFixed(2)}`);
+        lines.push(`預期月淨利：<b>${profit >= 0 ? '+' : '-'}US$${Math.abs(profit).toFixed(2)}</b>`);
+        const roi = cost.total > 0 ? profit / cost.total * 100 : null;
+        lines.push(roi == null ? '預期月收益率：不適用（月成本為 0）'
+            : `預期月收益率：<b>${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%</b>`);
+    }
+    lines.push('<i>收益率＝（預期月收益－月成本）÷月成本；依目前速度與美區月繳未稅牌價估算</i>');
+    return lines.join('\n');
+}
+
 // ---- 每日損益報告排版 ----
-function formatDaily(d, state, taipeiDate) {
+function formatDaily(d, state, taipeiDate, cost) {
     const m = (n) => `$${Number(n).toFixed(4)}`;
     const yd = state.yesterdayTotal;
     const lines = [`昨日收益：<b>${yd == null ? '（尚無紀錄）' : m(yd)}</b>`];
+    lines.push('', formatMonthlyCost(cost).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+    const monthlyCost = cost.unknownCount === 0 ? cost.total : null;
 
     // 日成本由月成本平攤到本期天數，避免手填的 $7×31=217 與月成本 200 對不起來
     const totalDays = state.billingStart ? daysInPeriod(state.billingStart) : 30;
-    const dailyCost = MONTHLY_COST > 0 ? MONTHLY_COST / totalDays : DAILY_COST;
+    const dailyCost = monthlyCost == null ? null : monthlyCost / totalDays;
 
-    if (yd != null && dailyCost > 0) {
+    if (yd != null && dailyCost != null) {
         const pnl = yd - dailyCost;
         const sign = pnl >= 0 ? '+' : '-';
         lines.push(`昨日損益：<b>${sign}$${Math.abs(pnl).toFixed(4)}</b>（日成本 $${dailyCost.toFixed(2)}）`);
     }
 
-    if (state.billingStart && MONTHLY_COST > 0) {
+    if (state.billingStart && monthlyCost > 0) {
         const { earned, days: doneDays } = sumPeriod(state.billingStart);
-        const pct = (earned / MONTHLY_COST) * 100;
+        const pct = (earned / monthlyCost) * 100;
         const day = Math.floor(
             (new Date(`${taipeiDate}T00:00:00Z`) - new Date(`${state.billingStart}T00:00:00Z`)) / 86400000
         ) + 1;
@@ -186,7 +218,7 @@ function formatDaily(d, state, taipeiDate) {
         lines.push(
             '',
             `本期進度（第 ${day} 天／共 ${totalDays} 天）`,
-            `　已賺 $${earned.toFixed(2)} ／ 月成本 $${MONTHLY_COST}（${pct.toFixed(1)}%）`,
+            `　已賺 $${earned.toFixed(2)} ／ 月成本估算 $${monthlyCost}（${pct.toFixed(1)}%）`,
             `　${'▓'.repeat(filled)}${'░'.repeat(20 - filled)}`
         );
         if (doneDays >= 1) {
@@ -286,8 +318,8 @@ function taipeiNow() {
 // 主啟動函式：把整個模組掛到既有的 bot 上
 // ==========================================
 function initDeRouter(bot) {
-    if (!process.env.DEROUTER_MGMT_KEY || !process.env.DEROUTER_CHAT_ID) {
-        console.warn('[derouter] 未設定 DEROUTER_MGMT_KEY 或 DEROUTER_CHAT_ID，收益模組略過啟動');
+    if (!process.env.DEROUTER_CHAT_ID) {
+        console.warn('[derouter] 未設定 DEROUTER_CHAT_ID，收益模組略過啟動');
         return;
     }
     const CHAT_ID = process.env.DEROUTER_CHAT_ID;
@@ -295,14 +327,36 @@ function initDeRouter(bot) {
     let state = loadState();
 
     // ---- 指令：即時查詢（僅限本人）----
-    bot.onText(/^\/(derouter|earn|收益)\b/, async (msg) => {
+    bot.onText(/^\/(derouter|earn|收益)(?:@\w+)?(?:\s+(auto|api|chain))?\s*$/i, async (msg, match) => {
         if (msg.from.id !== OWNER_ID) return; // 非本人一律忽略，保護個人收益隱私
+        const selected = match?.[2]?.toLowerCase();
+        if (selected) {
+            state.earningsSource = selected;
+            saveState(state);
+        }
+        const source = ['api', 'chain'].includes(state.earningsSource) ? state.earningsSource : 'auto';
+        const reply = text => bot.sendMessage(msg.chat.id, text, {
+            parse_mode: 'HTML', message_thread_id: msg.message_thread_id,
+        });
         try {
-            const d = await fetchEarnings();
-            bot.sendMessage(msg.chat.id, formatEarnings(d), {
-                parse_mode: 'HTML',
-                message_thread_id: msg.message_thread_id,
-            });
+            if (source === 'chain') {
+                await reply(formatChainEarnings(await fetchChainEarnings()));
+                return;
+            }
+            let d;
+            try { d = await fetchEarnings(); }
+            catch (apiError) {
+                if (source === 'api') throw apiError;
+                console.error('[derouter] API 無法讀取，切換鏈上統計:', apiError.message);
+                await reply(formatChainEarnings(await fetchChainEarnings(), true));
+                return;
+            }
+            trackToday(state, d);
+            saveState(state);
+            let cost = null;
+            try { cost = await fetchMonthlyCost(); }
+            catch (e) { console.error('[derouter] 月成本讀取失敗:', e.message); }
+            await reply(formatEarnings(d, formatExpectedReturn(d, cost)));
         } catch (e) {
             bot.sendMessage(msg.chat.id, `❌ 讀取 DeRouter 收益失敗：${e.message}`, {
                 message_thread_id: msg.message_thread_id,
@@ -387,6 +441,7 @@ function initDeRouter(bot) {
             saveState(state);
             try {
                 const d = await fetchEarnings();
+                const cost = await fetchMonthlyCost();
                 trackToday(state, d); // 讓換日邏輯先跑，確保 yesterdayTotal／基準已更新
                 // 依時段選問候語（早/午/晚），避免半夜還說「早安」
                 const greet = DAILY_HOUR < 5 ? '夜深了' :
@@ -394,7 +449,7 @@ function initDeRouter(bot) {
                               DAILY_HOUR < 18 ? '午安' : '晚安';
                 bot.sendMessage(
                     CHAT_ID,
-                    `<b>${greet}！DeRouter 每日損益報告</b>\n\n` + formatDaily(d, state, date),
+                    `<b>${greet}！DeRouter 每日損益報告</b>\n\n` + formatDaily(d, state, date, cost),
                     { parse_mode: 'HTML' }
                 );
             } catch (e) {

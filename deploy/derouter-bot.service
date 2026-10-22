@@ -1,0 +1,30 @@
+[Unit]
+Description=DeRouter Telegram bot
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=derouter
+Group=derouter
+WorkingDirectory=/opt/derouter-telegram-bot
+ExecStart=__NODE_BIN__ /opt/derouter-telegram-bot/index.js
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--max-old-space-size=384
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/derouter-telegram-bot
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=derouter-bot
+
+[Install]
+WantedBy=multi-user.target

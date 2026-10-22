@@ -9,3 +9,7 @@ node_modules/
 *_state.json
 *_state.seed.json
 derouter_daily.jsonl
+
+# 鏈上交易快取、分頁游標及待處理佇列（包含原子寫入的暫存檔）
+chain_state.json
+chain_state.json.tmp

@@ -28,10 +28,11 @@
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const { calculateMonthlyCost, formatMonthlyCost } = require('./costs');
+const { fetchEarnings } = require('./earnings-api');
 
 const API_BASE = 'https://api.derouter.network/api';
 const CONTAINERS_URL = `${API_BASE}/containers`;
-const EARN_URL = `${API_BASE}/billing/earnings`;
 const STATE_FILE = path.join(__dirname, 'dispatch_state.json');
 const TZ = 'Asia/Taipei';
 
@@ -65,8 +66,8 @@ async function fetchContainers() {
     return res.data;
 }
 async function fetchToday() {
-    const res = await axios.get(EARN_URL, { headers: authHeader(), timeout: 15000 });
-    return Number(res.data.today);
+    const data = await fetchEarnings();
+    return Number(data.today);
 }
 // 用 email 從容器清單找出帳號當下的 containerId / accountId / 現在的模式
 function findAccount(containers, email) {
@@ -136,6 +137,29 @@ function fmtTaipei(iso) {
     return new Intl.DateTimeFormat('zh-TW', {
         timeZone: TZ, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
     }).format(new Date(iso));
+}
+
+function quotaPlanLabel(account, budget) {
+    const plan = account.plan || budget?.plan || '未知方案';
+    if (plan !== 'team') return plan;
+    const tiers = {
+        team_standard: 'Standard',
+        team_tier_1: 'Premium',
+        team_premium: 'Premium',
+    };
+    return `Team ${tiers[account.seatTier] || `（席位未識別：${account.seatTier || '未知'}）`}`;
+}
+
+function quotaRemainingLabel(value) {
+    if (value == null || value === '' || !Number.isFinite(Number(value))) return '—';
+    const pct = Number(value);
+    const emoji = pct <= 0 ? '🔴' : pct <= 5 ? '🟠' : pct >= 80 ? '🧊' : '';
+    return `${emoji}${pct}%`;
+}
+
+function quotaResetTime(value) {
+    const time = value ? Date.parse(value) : NaN;
+    return Number.isFinite(time) ? time : Infinity;
 }
 
 // ---- 台北現在的日期與小時 ----
@@ -361,31 +385,59 @@ function initDispatch(bot) {
         if (msg.from.id !== OWNER_ID) return;
         try {
             const containers = await fetchContainers();
-            const emailOf = {};
-            for (const c of containers || []) for (const a of (c.accounts || [])) emailOf[a.id] = a.email;
-            const out = ['DeRouter 剩餘額度'];
+            const accounts = new Map();
+            for (const c of containers || []) {
+                for (const a of c.accounts || []) accounts.set(a.id, { ...a, containerStatus: c.status });
+            }
+            const groups = new Map([['Codex', []], ['Claude', []], ['其他', []]]);
+            const now = Date.now();
+            const addEntry = (account, text, weeklyResetAt) => {
+                const group = { openai: 'Codex', anthropic: 'Claude' }[account.type] || '其他';
+                groups.get(group).push({ text, resetTime: quotaResetTime(weeklyResetAt) });
+            };
             const covered = new Set(); // 有額度資料的 accountId
             for (const c of containers || []) {
                 const budgets = await fetchBudgets(c.id);
                 for (const b of budgets) {
                     covered.add(b.accountId);
-                    const email = emailOf[b.accountId] || String(b.accountId).slice(0, 8);
-                    const warn = b.fiveHourPct <= 0 ? '（5H 已用罄）' : b.weeklyPct <= 0 ? '（週額度用罄）' : '';
-                    out.push(
-                        '',
-                        `${email}（${b.plan}）${warn}`,
-                        `　5 小時剩 ${b.fiveHourPct ?? '—'}%・週剩 ${b.weeklyPct ?? '—'}%`,
-                        `　5H 重置 ${fmtTaipei(b.resetAt)}・週重置 ${fmtTaipei(b.weeklyResetAt)}`
-                    );
+                    const account = accounts.get(b.accountId) || {};
+                    const email = account.email || String(b.accountId).slice(0, 8);
+                    const weeklyLow = b.weeklyPct != null && b.weeklyPct !== '' && Number.isFinite(Number(b.weeklyPct)) && Number(b.weeklyPct) <= 5;
+                    const weeklyEmpty = weeklyLow && Number(b.weeklyPct) <= 0;
+                    const warn = !weeklyLow && b.fiveHourPct != null && b.fiveHourPct <= 0 ? '（5H 已用罄）' : '';
+                    const untilReset = quotaResetTime(b.weeklyResetAt) - now;
+                    const soon = untilReset > 0 && untilReset <= 24 * 60 * 60 * 1000 ? '⏰' : '';
+                    addEntry(account, [
+                        `${email}（${quotaPlanLabel(account, b)}）${warn}`,
+                        weeklyEmpty ? '　🔴週額度用罄（0%）' : weeklyLow ? `　週剩 ${quotaRemainingLabel(b.weeklyPct)}` : `　5 小時剩 ${quotaRemainingLabel(b.fiveHourPct)}・週剩 ${quotaRemainingLabel(b.weeklyPct)}`,
+                        weeklyLow ? `　${soon}週重置 ${fmtTaipei(b.weeklyResetAt)}` : `　5H 重置 ${fmtTaipei(b.resetAt)}・${soon}週重置 ${fmtTaipei(b.weeklyResetAt)}`
+                    ].join('\n'), b.weeklyResetAt);
                 }
             }
             // 平台對「暫停/剛加入還沒跑過」的帳號不會回額度資料，逐一列出原因，不再無聲空白
-            const missing = listAccounts(containers).filter((a) => !covered.has(a.accountId));
-            for (const a of missing) {
-                out.push('', `${a.email}（${statusLabel(a)}）`, '　尚無額度資料（通常帳號啟動並開始跑任務後才會出現）');
+            const missing = [...accounts.entries()].filter(([id]) => !covered.has(id));
+            for (const [, a] of missing) {
+                addEntry(a, `${a.email}（${quotaPlanLabel(a)}・${statusLabel(a)}）\n　尚無額度資料（通常帳號啟動並開始跑任務後才會出現）`);
             }
-            if (covered.size === 0 && missing.length === 0) out.push('', '目前沒有任何帳號');
-            bot.sendMessage(msg.chat.id, out.join('\n'), { message_thread_id: msg.message_thread_id });
+            const opts = { message_thread_id: msg.message_thread_id };
+            const costLine = formatMonthlyCost(calculateMonthlyCost(containers));
+            if (covered.size === 0 && missing.length === 0) {
+                await bot.sendMessage(msg.chat.id, `DeRouter 剩餘額度\n${costLine}\n\n目前沒有任何帳號`, opts);
+            }
+            for (const [group, entries] of groups) {
+                if (!entries.length) continue;
+                entries.sort((a, b) => a.resetTime === b.resetTime ? 0 : a.resetTime < b.resetTime ? -1 : 1);
+                const heading = `DeRouter 剩餘額度 — ${group}\n${costLine}\n⏰週重置≤24h｜🔴用罄｜🟠剩≤5%｜🧊剩≥80%（用得少）`;
+                let text = heading;
+                for (const { text: entry } of entries) {
+                    if (text.length + entry.length + 2 > 3900) {
+                        await bot.sendMessage(msg.chat.id, text, opts);
+                        text = `${heading}（續）`;
+                    }
+                    text += `\n\n${entry}`;
+                }
+                await bot.sendMessage(msg.chat.id, text, opts);
+            }
         } catch (e) {
             bot.sendMessage(msg.chat.id, `讀取額度失敗：${e.message}`, { message_thread_id: msg.message_thread_id });
         }

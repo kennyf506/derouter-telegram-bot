@@ -22,6 +22,7 @@ const { initDeRouter } = require('./derouter');
 const { initDispatch } = require('./dispatch');
 initDeRouter(bot);
 initDispatch(bot);
+require('./chain-earnings').startChainSync();
 
 // polling 自動復原：斷網 (EFATAL/ENOTFOUND) 會讓 polling 默默停掉，
 // 這裡在錯誤發生後 10 秒自動重啟 polling，避免 bot 看似 online 其實卡死
