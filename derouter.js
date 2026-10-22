@@ -417,9 +417,13 @@ function initDeRouter(bot) {
             const nowUtcDate = new Date().toISOString().slice(0, 10);
             const levelNow = Math.floor(today / ALERT_STEP); // 今日跨到第幾個關卡
 
-            if (state.todayLevelDate !== nowUtcDate) {
-                // 新的一天：today 已歸零，重設每日關卡基準，不發提醒
+            if (state.todayLevelDate !== nowUtcDate || state.todayLevelStep !== ALERT_STEP) {
+                // 新的一天（today 已歸零），或 ALERT_STEP 被改過 → 重設關卡基準，不發提醒。
+                // lastTodayLevel 存的是「關卡序號」而非金額，單位隨 ALERT_STEP 改變：
+                // 例如 $51 在 step=1 時序號是 51，改成 step=5 後同樣金額只剩 10，
+                // 不一併重設就會讓 levelNow > lastTodayLevel 永遠為假、整天發不出提醒。
                 state.todayLevelDate = nowUtcDate;
+                state.todayLevelStep = ALERT_STEP;
                 state.lastTodayLevel = levelNow;
                 saveState(state);
             } else if (state.lastTodayLevel == null) {
