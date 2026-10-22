@@ -18,7 +18,7 @@
 // ==========================================
 const fs = require('fs');
 const path = require('path');
-const { fetchMonthlyCost, formatMonthlyCost } = require('./costs');
+const { fetchMonthlyCost } = require('./costs');
 const { fetchEarnings } = require('./earnings-api');
 const { fetchChainEarnings, formatChainEarnings } = require('./chain-earnings');
 
@@ -190,22 +190,27 @@ function formatExpectedReturn(d, cost, entries = readDailyLog(), now = new Date(
     return lines.join('\n');
 }
 
-// ---- 每日損益報告排版 ----
+// ---- 每日損益報告排版（精簡四行版）----
+// 昨日／本期／進度條／日均＋推估各一行，資料不足的行自動省略。
+// 月成本明細（formatMonthlyCost）刻意不放進日報，只取總額當單一數字用。
 function formatDaily(d, state, taipeiDate, cost) {
-    const m = (n) => `$${Number(n).toFixed(4)}`;
     const yd = state.yesterdayTotal;
-    const lines = [`昨日收益：<b>${yd == null ? '（尚無紀錄）' : m(yd)}</b>`];
-    lines.push('', formatMonthlyCost(cost).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
-    const monthlyCost = cost.unknownCount === 0 ? cost.total : null;
+    const lines = [];
+    const monthlyCost = cost && cost.unknownCount === 0 ? cost.total : null;
 
-    // 日成本由月成本平攤到本期天數，避免手填的 $7×31=217 與月成本 200 對不起來
+    // 日成本由月成本平攤到本期天數，避免手填的 $7×31=217 與月成本對不起來
     const totalDays = state.billingStart ? daysInPeriod(state.billingStart) : 30;
     const dailyCost = monthlyCost == null ? null : monthlyCost / totalDays;
 
-    if (yd != null && dailyCost != null) {
+    // 第一行：昨日收益與損益併在一起（全角空白分隔）
+    if (yd == null) {
+        lines.push('昨日 <b>（尚無紀錄）</b>');
+    } else if (dailyCost != null) {
         const pnl = yd - dailyCost;
         const sign = pnl >= 0 ? '+' : '-';
-        lines.push(`昨日損益：<b>${sign}$${Math.abs(pnl).toFixed(4)}</b>（日成本 $${dailyCost.toFixed(2)}）`);
+        lines.push(`昨日 <b>$${yd.toFixed(2)}</b>　損益 <b>${sign}$${Math.abs(pnl).toFixed(2)}</b>`);
+    } else {
+        lines.push(`昨日 <b>$${yd.toFixed(2)}</b>`);
     }
 
     if (state.billingStart && monthlyCost > 0) {
@@ -216,25 +221,21 @@ function formatDaily(d, state, taipeiDate, cost) {
         ) + 1;
         const filled = Math.max(0, Math.min(20, Math.round(pct / 5))); // 20 格，每格 5%
         lines.push(
-            '',
-            `本期進度（第 ${day} 天／共 ${totalDays} 天）`,
-            `　已賺 $${earned.toFixed(2)} ／ 月成本估算 $${monthlyCost}（${pct.toFixed(1)}%）`,
-            `　${'▓'.repeat(filled)}${'░'.repeat(20 - filled)}`
+            `本期 <b>$${earned.toFixed(2)}／$${monthlyCost}</b>（${pct.toFixed(1)}%）　第 ${day}／${totalDays} 天`,
+            `${'▓'.repeat(filled)}${'░'.repeat(20 - filled)}`
         );
         if (doneDays >= 1) {
             // 已賺的部分是事實，不再拿日均去重估它；只用日均推「剩下還沒發生的天數」
             const avg = earned / doneDays;
             const remaining = Math.max(0, totalDays - day + 1);
             const projected = earned + remaining * avg;
-            lines.push(`　日均 $${avg.toFixed(2)}（${doneDays} 天）／剩 ${remaining} 天`);
-            lines.push(`　推估期末約 $${Math.round(projected)}`);
+            lines.push(`日均 $${avg.toFixed(2)}　推估期末 $${Math.round(projected)}（剩 ${remaining} 天）`);
         }
         // 回寫快取鏡像，方便直接看 state 檔除錯；真相仍以紀錄檔為準
         state.periodEarned = earned;
         state.periodDays = doneDays;
     }
 
-    lines.push('', `累計 AllTime：<b>${m(d.allTime)}</b>`, `Requests Served：<b>${d.requestsAll}</b>`);
     return lines.join('\n');
 }
 
@@ -276,6 +277,46 @@ function trackToday(state, d) {
         }
     }
     saveState(state);
+}
+
+// ---- 本週累計（自訂週界：每週一 18:00 台北＝週一 10:00 UTC）----
+// 台北固定 UTC+8、無日光節約，所以週界可直接在 UTC 上算。
+// 回傳「包含現在的那一週」的起始時刻（ISO 字串，當 state 的週別鍵用）。
+function weekWindowStart(now = new Date()) {
+    const d = new Date(now.getTime());
+    const dow = d.getUTCDay();                       // 0=週日, 1=週一
+    // 回推到本週一 10:00 UTC
+    const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 10, 0, 0));
+    monday.setUTCDate(monday.getUTCDate() - ((dow + 6) % 7));
+    // 還沒到本週一 10:00（例：週一上午）→ 仍屬上一週
+    if (d < monday) monday.setUTCDate(monday.getUTCDate() - 7);
+    return monday.toISOString();
+}
+
+// 以輪詢增量累加本週收益。不能用 API 的 week（UTC 週界，對不上週一 18:00），
+// 也不能用 allTime 差值（平台會回頭下修）；只有 today 的增量是可信的。
+// 代價：停機期間的增量會漏算，寧可少算也不要記錯。
+function trackWeek(state, d) {
+    const ws = weekWindowStart();
+    const today = Number(d.today);
+    const utcDate = new Date().toISOString().slice(0, 10);
+
+    if (state.weekStart !== ws) {
+        // 新的一週（或第一次啟動）：以此刻為起點，重置前賺的不計入
+        state.weekStart = ws;
+        state.weekAccum = 0;
+    } else {
+        const prev = Number(state.weekLastToday);
+        if (Number.isFinite(prev)) {
+            // UTC 換日 today 會歸零 → 整個新值都算新增；同一天內只取增加的部分
+            const delta = state.weekLastDate !== utcDate ? today : Math.max(0, today - prev);
+            state.weekAccum = (Number(state.weekAccum) || 0) + delta;
+        }
+    }
+    state.weekLastToday = today;
+    state.weekLastDate = utcDate;
+    saveState(state);  // 每次輪詢都要落地，否則重啟會把本週累計漏掉
+    return Number(state.weekAccum) || 0;
 }
 
 // ---- 今日達標的時間工具 ----
@@ -370,9 +411,9 @@ function initDeRouter(bot) {
         try {
             const d = await fetchEarnings();
             trackToday(state, d);                      // 順手記錄，供每日總結算「昨日收益」
+            const weekAccum = trackWeek(state, d);     // 累加本週（週一 18:00 台北歸零）
             checkDailyGoal(d);                         // 今日是否達各門檻（達標提醒）
             const today = Number(d.today);             // 當日收益（UTC 午夜歸零）
-            const at = Number(d.allTime);              // 累計值
             const nowUtcDate = new Date().toISOString().slice(0, 10);
             const levelNow = Math.floor(today / ALERT_STEP); // 今日跨到第幾個關卡
 
@@ -389,7 +430,7 @@ function initDeRouter(bot) {
                 saveState(state);
                 bot.sendMessage(
                     CHAT_ID,
-                    `DeRouter 今日收益突破 $${levelNow * ALERT_STEP}（目前累計 $${at.toFixed(4)}、${d.allTimeTasks} tasks）`
+                    `DeRouter 今日收益達到 $${levelNow * ALERT_STEP}，本週累計 $${weekAccum.toFixed(2)}`
                 );
             }
         } catch (e) {
@@ -436,24 +477,27 @@ function initDeRouter(bot) {
     // ---- 每分鐘檢查一次：到台北 08:00（UTC 換日）且今天還沒送過 → 送前一日總結 ----
     async function dailyCheck() {
         const { date, hour } = taipeiNow();
-        if (hour === DAILY_HOUR && state.lastDailySent !== date) {
-            state.lastDailySent = date;
-            saveState(state);
+        if (hour >= DAILY_HOUR && state.lastDailySent !== date) {
             try {
                 const d = await fetchEarnings();
                 const cost = await fetchMonthlyCost();
                 trackToday(state, d); // 讓換日邏輯先跑，確保 yesterdayTotal／基準已更新
-                // 依時段選問候語（早/午/晚），避免半夜還說「早安」
-                const greet = DAILY_HOUR < 5 ? '夜深了' :
-                              DAILY_HOUR < 12 ? '早安' :
-                              DAILY_HOUR < 18 ? '午安' : '晚安';
-                bot.sendMessage(
+                // 依時段選圖示（半夜/早/午/晚），避免半夜還掛著太陽
+                const icon = DAILY_HOUR < 5 ? '🌙' :
+                             DAILY_HOUR < 12 ? '🌞' :
+                             DAILY_HOUR < 18 ? '☀️' : '🌙';
+                const mmdd = date.slice(5).replace('-', '/'); // YYYY-MM-DD → MM/DD
+                await bot.sendMessage(
                     CHAT_ID,
-                    `<b>${greet}！DeRouter 每日損益報告</b>\n\n` + formatDaily(d, state, date, cost),
+                    `${icon} <b>DeRouter 日報</b>｜${mmdd}\n\n` + formatDaily(d, state, date, cost),
                     { parse_mode: 'HTML' }
                 );
+                // 只有「發送成功」才標記已送；失敗則不標記 → 下一分鐘自動重試，
+                // 不會再因 08:00 一次網路閃斷就整天漏掉日報。
+                state.lastDailySent = date;
+                saveState(state);
             } catch (e) {
-                bot.sendMessage(CHAT_ID, `每日損益報告讀取失敗：${e.message}`);
+                console.error(`[derouter] 日報發送失敗，將於下次重試：${e.message}`);
             }
         }
     }
